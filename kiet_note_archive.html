@@ -719,8 +719,8 @@ function populateYearOptions(){
 async function loadEntries(){
   el('listWrap').innerHTML = '<div class="loading">불러오는 중…</div>';
   try{
-    const res = await window.storage.get(STORAGE_KEY, false);
-    entries = res && res.value ? JSON.parse(res.value) : [];
+    const raw = localStorage.getItem(STORAGE_KEY);
+    entries = raw ? JSON.parse(raw) : [];
   }catch(e){ entries = []; }
   renderFilters();
   renderList();
@@ -733,9 +733,78 @@ async function loadEntries(){
 
 async function persistEntries(){
   try{
-    const result = await window.storage.set(STORAGE_KEY, JSON.stringify(entries), false);
-    return !!result;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+    return true;
   }catch(e){ return false; }
+}
+
+/* ---- 브리핑 자동 반영 ----
+   notes/index.json에 등록된 브리핑 html을 읽어, 그 안에 심어둔
+   <script type="application/json" id="kiet-briefing-data"> 블록을 파싱해서
+   기록으로 자동 추가한다. 같은 브리핑을 다시 읽어도 id가 고정돼 있어 중복되지 않고,
+   소스가 갱신되면 제목·링크·태그·AI요약은 최신 내용으로 다시 채워진다.
+   단, 한 번이라도 "기록 작성" 화면에서 직접 수정해 저장한 항목(auto 플래그가 꺼진 항목)은
+   더 이상 자동 갱신하지 않는다 — 내가 손댄 순간부터는 온전히 내 기록으로 취급.
+   내가 쓴 요약/핵심사례/복습상태는 항상 보존된다.
+   GitHub Pages 같은 http(s) 환경에서만 동작하고, 파일을 그냥 더블클릭해서 열면
+   브라우저 보안 정책상 조용히 건너뛴다. */
+let lastAutoImportCount = 0;
+
+async function autoImportBriefings(){
+  try{
+    const res = await fetch('notes/index.json', {cache:'no-store'});
+    if(!res.ok) return;
+    const manifest = await res.json();
+    if(!Array.isArray(manifest)) return;
+
+    let added = 0;
+    let touched = false;
+    for(const item of manifest){
+      try{
+        const page = await fetch(item.path, {cache:'no-store'});
+        if(!page.ok) continue;
+        const html = await page.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const dataEl = doc.getElementById('kiet-briefing-data');
+        if(!dataEl) continue;
+        const data = JSON.parse(dataEl.textContent);
+
+        (data.reports || []).forEach((r, i) => {
+          const id = `auto_${data.date}_${data.topic}_${i}`;
+          const idx = entries.findIndex(x => x.id === id);
+          const prev = idx >= 0 ? entries[idx] : null;
+
+          if(prev && !prev.auto) return; // 직접 수정해서 저장한 기록은 자동 갱신 대상에서 제외
+
+          const rec = {
+            id,
+            date: data.date,
+            topic: data.topic,
+            title: r.title || '(제목 없음)',
+            link: r.link || '',
+            reportYear: r.reportYear || '',
+            tags: r.tags || [],
+            aiSummary: r.aiSummary || '',
+            mySummary: prev ? prev.mySummary : '',
+            keyCase: prev ? prev.keyCase : '',
+            review: prev ? (prev.review || 0) : 0,
+            auto: true,
+            sourcePath: item.path
+          };
+          if(idx >= 0){ entries[idx] = rec; } else { entries.push(rec); added++; }
+          touched = true;
+        });
+      }catch(inner){ /* 이 파일 하나만 건너뛰고 계속 진행 */ }
+    }
+
+    if(touched){
+      await persistEntries();
+      renderFilters(); renderList(); updateBadge();
+      renderReviewPanel(); renderCoveragePanel(); renderCasesPanel();
+    }
+    lastAutoImportCount = added;
+    updateTodayGreeting();
+  }catch(e){ /* notes/index.json이 없거나 file://로 열린 경우 — 조용히 건너뜀 */ }
 }
 
 function updateBadge(){
@@ -774,8 +843,9 @@ function renderList(){
     card.className = 'entry-item' + (e.id===selectedId ? ' selected' : '');
     const checkCls = 'check-' + (e.review||0);
     const checkMark = e.review===2 ? '✔' : (e.review===1 ? '·' : '');
+    const autoTag = e.auto ? '<span style="font-size:9.5px;font-weight:800;color:var(--accent);background:var(--accent-soft);border-radius:999px;padding:1px 6px;margin-right:6px;">AUTO</span>' : '';
     card.innerHTML = `
-      <div class="ttl">${escapeHtml(e.title || "(제목 없음)")}</div>
+      <div class="ttl">${autoTag}${escapeHtml(e.title || "(제목 없음)")}</div>
       <div class="meta">
         <span>${e.date||""}</span>
         <span class="check ${checkCls}">${checkMark}</span>
@@ -921,11 +991,16 @@ function updateTodayGreeting(){
     .map(e=>nextReviewInfo(e))
     .filter(info=> info && info.diffDays >= 0).length;
   const weekday = new Date().getDay();
+  let msg;
   if(weekday===0){
-    box.textContent = "오늘은 일요일 — 휴식일입니다. 밀린 복습이 있다면 아래에서 확인하세요.";
+    msg = "오늘은 일요일 — 휴식일입니다. 밀린 복습이 있다면 아래에서 확인하세요.";
   }else{
-    box.textContent = `오늘은 ${topicLabel} 하는 날입니다.` + (dueCount>0 ? ` 복습 대기 ${dueCount}건이 있어요.` : " 복습할 항목은 없어요.");
+    msg = `오늘은 ${topicLabel} 하는 날입니다.` + (dueCount>0 ? ` 복습 대기 ${dueCount}건이 있어요.` : " 복습할 항목은 없어요.");
   }
+  if(lastAutoImportCount > 0){
+    msg = `📥 새 브리핑 ${lastAutoImportCount}건을 자동으로 가져왔어요. ` + msg;
+  }
+  box.textContent = msg;
 }
 
 /* ---- 오늘의 복습 ---- */
@@ -1205,16 +1280,16 @@ let selectedOutlineId = null;
 
 async function loadOutlines(){
   try{
-    const res = await window.storage.get(OUTLINE_KEY, false);
-    outlines = res && res.value ? JSON.parse(res.value) : [];
+    const raw = localStorage.getItem(OUTLINE_KEY);
+    outlines = raw ? JSON.parse(raw) : [];
   }catch(e){ outlines = []; }
   renderOutlineList();
 }
 
 async function persistOutlines(){
   try{
-    const result = await window.storage.set(OUTLINE_KEY, JSON.stringify(outlines), false);
-    return !!result;
+    localStorage.setItem(OUTLINE_KEY, JSON.stringify(outlines));
+    return true;
   }catch(e){ return false; }
 }
 
@@ -1428,10 +1503,13 @@ tocToggleBtn.addEventListener('click', ()=>{
 });
 
 newEntryForm();
-loadEntries();
 newOutlineForm();
 loadOutlines();
-switchView('review');
+(async () => {
+  await loadEntries();
+  switchView('review');
+  await autoImportBriefings();
+})();
 
 /* ---- collapsible sticky header ---- */
 const topbar = document.querySelector('.topbar');
